@@ -1,0 +1,53 @@
+# Interactive Tryptic CT Viewer
+
+## Package Overview
+This package provides:
+- **io_tiff**: reads a single multipage TIFF or a sequence of single-page TIFFs (directory, glob, or list), with lazy single-slice reads and optional `tifffile.memmap` for multipage files.
+
+- **interactive_plotter** An interactive 3-view slice viewer:
+    - Pan / Zoom (linked across views)
+    - Slice sliders (Z, Y, X)
+    - Min/Max contrast and colormap controls (shared colorbar)
+    - Histograms (per view)
+    - Trinarize toggle (auto thresholds from central slices)
+    - 3D rotation in 0.1° increments (Yaw / Pitch / Roll)
+    - Fast reslice engine (default): rotates only the visible planes, works well for very large volumes.
+    - Legacy full-volume rotation engine: slower but rotates the full array.
+    - Fast Preview toggle: nearest-neighbor interpolation for snappy rotation previews; linear interpolation for final viewing.
+    - Save current view as a figure.
+    - Volumes are expected in (Z, Y, X) order. You can pass either:
+        - A numpy.ndarray
+        - A TIFF stack (single file or directory of slices).
+
+## Installation
+Use one of the following options: 
+1. Clone / copy the files
+    Place the following files in the same directory: interactive_plotter.py, io_tiff.py
+
+2. Python environment.
+This project works best in a Jupyter Notebook / JupyterLab environment.
+Create a conda or venv environment and install dependencies:
+```bash
+# Using conda
+conda create -n ctviewer python=3.11 -y
+conda activate ctviewer
+conda install numpy matplotlib ipywidgets -y
+# Optional: faster & higher-quality rotation
+conda install scipy -y
+```
+
+Enable ipywidgets for Jupyter (if not already enabled):
+```bash
+jupyter nbextension enable --py widgetsnbextension --sys-prefix
+```
+
+Or for JupyterLab 3+:
+```bash
+pip install jupyterlab_widgets
+```
+
+## Notes
+- The fast slice-reslice engine is recommended for large datasets.
+- Use Fast Preview toggle to enable nearest-neighbor rotation previews (useful on huge volumes).
+- The legacy volume engine (rotation_engine="volume") rotates the entire 3D block. Only use this for validation or small volumes.
+-  Make sure your volume is stored as ``float32`` or ``uint16`` for best memory efficiency.
