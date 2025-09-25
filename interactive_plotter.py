@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Iterable, Union, Dict
+from typing import Iterable, Union, Dict, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,20 +11,23 @@ from ipywidgets import (
 )
 from IPython.display import display
 
-# Optional SciPy for smooth 3D rotation
-USE_SCIPY_ROTATE = True
+# --- Optional SciPy for high-quality interpolation ---
+USE_SCIPY = True
 try:
     from scipy.ndimage import rotate as nd_rotate
+    from scipy.ndimage import map_coordinates as nd_map_coordinates
 except Exception:
-    USE_SCIPY_ROTATE = False
+    USE_SCIPY = False
     nd_rotate = None
+    nd_map_coordinates = None
 
-# Optional TIFF reader (your io_tiff.py)
+# --- Optional TIFF reader (your io_tiff.py) ---
 try:
     from io_tiff import read_volume as _read_volume
 except Exception:
     _read_volume = None
 
+# ---------------- Utilities ----------------
 def _finite(a):
     a = np.asarray(a)
     return a[np.isfinite(a)]
@@ -56,55 +59,90 @@ def _make_step_xy(counts, edges):
     y[1::2] = counts
     return x, y
 
-# Simple nearest-neighbor 2D rotate (fallback)
-def _rotate2d_nn(arr2d, deg):
-    if abs(deg) < 1e-12:
-        return arr2d
-    rad = np.deg2rad(deg)
-    c, s = np.cos(rad), np.sin(rad)
-    h, w = arr2d.shape
-    yy, xx = np.mgrid[0:h, 0:w]
-    cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
-    x0 = xx - cx
-    y0 = yy - cy
-    # inverse rotation mapping
-    xr = c * x0 + s * y0
-    yr = -s * x0 + c * y0
-    xi = np.rint(xr + cx).astype(int)
-    yi = np.rint(yr + cy).astype(int)
-    out = np.full_like(arr2d, np.nan)
-    m = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
-    out[m] = arr2d[yi[m], xi[m]]
+# ---------- Rotation math (index space: z,y,x) ----------
+def _rot_mats(deg_z: float, deg_y: float, deg_x: float) -> np.ndarray:
+    """Rotation matrix applying Z (yaw) -> Y (pitch) -> X (roll)."""
+    rz = np.deg2rad(deg_z); ry = np.deg2rad(deg_y); rx = np.deg2rad(deg_x)
+    cz, sz = np.cos(rz), np.sin(rz)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cx, sx = np.cos(rx), np.sin(rx)
+    Rz = np.array([[1, 0, 0],
+                   [0, cz, -sz],
+                   [0, sz,  cz]], dtype=float)  # rotate y-x around z
+    Ry = np.array([[ cy, 0, sy],
+                   [  0, 1,  0],
+                   [-sy, 0, cy]], dtype=float)  # rotate z-x around y
+    Rx = np.array([[1,  0,   0],
+                   [0, cx, -sx],
+                   [0, sx,  cx]], dtype=float)  # rotate z-y around x
+    return Rz @ Ry @ Rx
+
+def _grid_xy(ylen: int, xlen: int):
+    yy, xx = np.mgrid[0:ylen, 0:xlen]
+    return yy.astype(float), xx.astype(float)
+
+def _grid_zy(zlen: int, ylen: int):
+    zz, yy = np.mgrid[0:zlen, 0:ylen]
+    return zz.astype(float), yy.astype(float)
+
+def _grid_zx(zlen: int, xlen: int):
+    zz, xx = np.mgrid[0:zlen, 0:xlen]
+    return zz.astype(float), xx.astype(float)
+
+def _sample_trilinear(vol: np.ndarray, zf: np.ndarray, yf: np.ndarray, xf: np.ndarray, order: int) -> np.ndarray:
+    """Tri-linear sample at (zf,yf,xf); fall back to nearest if SciPy absent or order==0 requested."""
+    if USE_SCIPY and nd_map_coordinates is not None and order > 0:
+        coords = np.stack([zf, yf, xf], axis=0)
+        return nd_map_coordinates(vol, coords, order=order, mode='nearest', prefilter=False)
+    # Nearest neighbor
+    zi = np.rint(zf).astype(int); yi = np.rint(yf).astype(int); xi = np.rint(xf).astype(int)
+    out = np.full(zf.shape, np.nan, dtype=vol.dtype)
+    m = (zi >= 0) & (zi < vol.shape[0]) & (yi >= 0) & (yi < vol.shape[1]) & (xi >= 0) & (xi < vol.shape[2])
+    out[m] = vol[zi[m], yi[m], xi[m]]
     return out
 
+def _reslice_plane(vol: np.ndarray, R: np.ndarray, slice_idx: int, view: str, center: np.ndarray, order: int):
+    """
+    Fast: compute one plane of the rotated volume.
+    view: 'xy' (z'=const) -> (Y,X), 'zy' (x'=const) -> (Z,Y), 'zx' (y'=const) -> (Z,X)
+    """
+    Z, Y, X = vol.shape
+    cz, cy, cx = center
+    Rinvt = np.linalg.inv(R).T  # row-vector convention for (u-c) @ Rinvt + c
+
+    if view == 'xy':
+        yy, xx = _grid_xy(Y, X)
+        zprime = np.full_like(yy, float(slice_idx))
+        u = np.stack([zprime - cz, yy - cy, xx - cx], axis=-1)
+    elif view == 'zy':
+        zz, yy = _grid_zy(Z, Y)
+        xprime = np.full_like(zz, float(slice_idx))
+        u = np.stack([zz - cz, yy - cy, xprime - cx], axis=-1)
+    elif view == 'zx':
+        zz, xx = _grid_zx(Z, X)
+        yprime = np.full_like(zz, float(slice_idx))
+        u = np.stack([zz - cz, yprime - cy, xx - cx], axis=-1)
+    else:
+        raise ValueError("view must be 'xy', 'zy', or 'zx'")
+
+    p = u @ Rinvt + np.array([cz, cy, cx])
+    pz, py, px = p[..., 0], p[..., 1], p[..., 2]
+    return _sample_trilinear(vol, pz, py, px, order=order)
+
+# Optional whole-volume rotation (legacy)
 def rotate_volume_3d(vol: np.ndarray, deg_z: float, deg_y: float, deg_x: float) -> np.ndarray:
     out = vol
     eps = 1e-12
-    if USE_SCIPY_ROTATE and nd_rotate is not None:
+    if USE_SCIPY and nd_rotate is not None:
         if abs(deg_z) > eps:
             out = nd_rotate(out, angle=deg_z, axes=(1, 2), reshape=False, order=1, mode="nearest", prefilter=False)
         if abs(deg_y) > eps:
             out = nd_rotate(out, angle=deg_y, axes=(0, 2), reshape=False, order=1, mode="nearest", prefilter=False)
         if abs(deg_x) > eps:
             out = nd_rotate(out, angle=deg_x, axes=(0, 1), reshape=False, order=1, mode="nearest", prefilter=False)
-        return out
-    # Fallbacks (slice-wise nearest neighbor rotations)
-    if abs(deg_z) > eps:
-        out = np.stack([_rotate2d_nn(slc, deg_z) for slc in out], axis=0)  # rotate each XY slice
-    if abs(deg_y) > eps:
-        oy = out.shape[1]
-        tmp = np.empty_like(out)
-        for yy in range(oy):
-            tmp[:, yy, :] = _rotate2d_nn(out[:, yy, :], deg_y)
-        out = tmp
-    if abs(deg_x) > eps:
-        ox = out.shape[2]
-        tmp = np.empty_like(out)
-        for xx in range(ox):
-            tmp[:, :, xx] = _rotate2d_nn(out[:, :, xx], deg_x)
-        out = tmp
     return out
 
+# --------------- I/O ---------------
 def _ensure_volume(vol_or_src: Union[np.ndarray, str, Iterable[str]], *, memmap=False) -> np.ndarray:
     if isinstance(vol_or_src, np.ndarray):
         vol = vol_or_src
@@ -116,11 +154,13 @@ def _ensure_volume(vol_or_src: Union[np.ndarray, str, Iterable[str]], *, memmap=
         raise ValueError("Expected volume shape (Z, Y, X).")
     return vol
 
-def interactive_slice_plotter(
+# --------------- Main factory ---------------
+def create_interactive_slice_plotter_with_rotation(
     vol_or_src: Union[np.ndarray, str, Iterable[str]],
     *,
     voxel_size: float = 1.0,
     units: str = "px",
+    cmap_label = "Intensity",
     lower_pct: float = 0.1,
     upper_pct: float = 99.9,
     interpolation: str = "antialiased",
@@ -129,10 +169,18 @@ def interactive_slice_plotter(
     dpi: int = 110,
     display_container: bool = True,
     memmap: bool = False,
+    rotation_engine: str = "slice",  # 'slice' (fast) or 'volume' (legacy)
 ) -> Dict[str, object]:
-    vol = _ensure_volume(vol_or_src, memmap=memmap)
-    zlen, ylen, xlen = vol.shape
+    """
+    Build an interactive three-view (XY, ZY, ZX) viewer with rotation.
+    rotation_engine='slice' reslices only the displayed planes (fast).
+    rotation_engine='volume' rotates the whole volume (slow on big arrays).
+    """
+    vol = _ensure_volume(vol_or_src, memmap=memmap).astype(np.float32, copy=False)
+    Z, Y, X = vol.shape
+    center = np.array([(Z - 1) / 2.0, (Y - 1) / 2.0, (X - 1) / 2.0], dtype=float)
 
+    # Contrast & colormap
     vmin0, vmax0 = _robust_minmax(vol, lower_pct, upper_pct)
     if vmin0 < 0 < vmax0:
         norm0 = TwoSlopeNorm(vcenter=0.0, vmin=vmin0, vmax=vmax0)
@@ -142,15 +190,21 @@ def interactive_slice_plotter(
         cmap0 = cmap_seq
     norm_holder = {"norm": norm0}
 
-    sZ, sY, sX = zlen // 2, ylen // 2, xlen // 2
+    # Initial slices
+    sZ, sY, sX = Z // 2, Y // 2, X // 2
     vx = vy = vz = float(voxel_size)
-    extent_xy = (0, xlen * vx, 0, ylen * vy)
-    extent_zy = (0, xlen * vx, 0, zlen * vz)
-    extent_zx = (0, ylen * vy, 0, zlen * vz)
+    extent_xy = (0, X * vx, 0, Y * vy)
+    extent_zy = (0, X * vx, 0, Z * vz)
+    extent_zx = (0, Y * vy, 0, Z * vz)
 
+    # Rotation state and cache
     rot_state = {"z": 0.0, "y": 0.0, "x": 0.0}
-    rot_cache = {"vol": vol.copy(), "angles": (0.0, 0.0, 0.0)}
+    rot_cache = {"vol": vol.copy(), "angles": (0.0, 0.0, 0.0), "R": _rot_mats(0.0, 0.0, 0.0)}
 
+    # Interpolation order state (1=linear, 0=nearest for fast preview)
+    interp_order_state = {"order": 1}
+
+    # Figure and axes
     out_fig = Output()
     with out_fig, plt.ioff():
         fig = plt.figure(figsize=(15, 5), dpi=dpi, constrained_layout=True)
@@ -167,34 +221,34 @@ def interactive_slice_plotter(
             pass
         display(fig.canvas)
 
+    # Base images
     im_xy = ax_xy.imshow(vol[sZ], cmap=cmap0, norm=norm0, origin="lower",
                          extent=extent_xy, interpolation=interpolation, aspect="equal")
-    ax_xy.set_title("XY (Z slice)")
     ax_xy.set_xlabel(f"X [{units}]"); ax_xy.set_ylabel(f"Y [{units}]")
 
     im_zy = ax_zy.imshow(vol[:, :, sX], cmap=cmap0, norm=norm0, origin="lower",
                          extent=extent_zy, interpolation=interpolation, aspect="equal")
-    ax_zy.set_title("ZY (X slice)")
     ax_zy.set_xlabel(f"X [{units}]"); ax_zy.set_ylabel(f"Z [{units}]")
 
     im_zx = ax_zx.imshow(vol[:, sY, :], cmap=cmap0, norm=norm0, origin="lower",
                          extent=extent_zx, interpolation=interpolation, aspect="equal")
-    ax_zx.set_title("ZX (Y slice)")
     ax_zx.set_xlabel(f"Y [{units}]"); ax_zx.set_ylabel(f"Z [{units}]")
 
-    (line_xy_y,) = ax_xy.plot([sX * vx, sX * vx], [0, ylen * vy], "w--", lw=1, alpha=0.9)
-    (line_xy_x,) = ax_xy.plot([0, xlen * vx], [sY * vy, sY * vy], "w--", lw=1, alpha=0.9)
-    (line_zy_x,) = ax_zy.plot([sX * vx, sX * vx], [0, zlen * vz], "w--", lw=1, alpha=0.9)
-    (line_zy_z,) = ax_zy.plot([0, xlen * vx], [sZ * vz, sZ * vz], "w--", lw=1, alpha=0.9)
-    (line_zx_y,) = ax_zx.plot([sY * vy, sY * vy], [0, zlen * vz], "w--", lw=1, alpha=0.9)
-    (line_zx_z,) = ax_zx.plot([0, ylen * vy], [sZ * vz, sZ * vz], "w--", lw=1, alpha=0.9)
+    # Crosshairs
+    (line_xy_y,) = ax_xy.plot([sX * vx, sX * vx], [0, Y * vy], "w--", lw=1, alpha=0.9)
+    (line_xy_x,) = ax_xy.plot([0, X * vx], [sY * vy, sY * vy], "w--", lw=1, alpha=0.9)
+    (line_zy_x,) = ax_zy.plot([sX * vx, sX * vx], [0, Z * vz], "w--", lw=1, alpha=0.9)
+    (line_zy_z,) = ax_zy.plot([0, X * vx], [sZ * vz, sZ * vz], "w--", lw=1, alpha=0.9)
+    (line_zx_y,) = ax_zx.plot([sY * vy, sY * vy], [0, Z * vz], "w--", lw=1, alpha=0.9)
+    (line_zx_z,) = ax_zx.plot([0, Y * vy], [sZ * vz, sZ * vz], "w--", lw=1, alpha=0.9)
 
     cbar = fig.colorbar(im_xy, ax=[ax_xy, ax_zy, ax_zx], fraction=0.046, pad=0.04)
-    cbar.set_label("Intensity")
+    cbar.set_label(cmap_label)
 
-    zslider = IntSlider(description="Z slice", min=0, max=zlen - 1, step=1, value=sZ, continuous_update=True)
-    yslider = IntSlider(description="Y slice", min=0, max=ylen - 1, step=1, value=sY, continuous_update=True)
-    xslider = IntSlider(description="X slice", min=0, max=xlen - 1, step=1, value=sX, continuous_update=True)
+    # Widgets
+    zslider = IntSlider(description="Z slice", min=0, max=Z - 1, step=1, value=sZ, continuous_update=True)
+    yslider = IntSlider(description="Y slice", min=0, max=Y - 1, step=1, value=sY, continuous_update=True)
+    xslider = IntSlider(description="X slice", min=0, max=X - 1, step=1, value=sX, continuous_update=True)
 
     min_box = FloatText(value=vmin0, description="Min:"); max_box = FloatText(value=vmax0, description="Max:")
     cmap_dd = Dropdown(options=[cmap_seq, "bone", "pink", "YlGnBu_r", "viridis", "inferno", cmap_div, "RdBu_r", "twilight", "twilight_shifted", "Spectral", "turbo"], value=cmap0, description="Colormap:")
@@ -205,11 +259,13 @@ def interactive_slice_plotter(
     trinarize_toggle = ToggleButton(value=False, description="Trinarize", tooltip="Toggle trinarized view")
     reset_btn = Button(description="Reset")
 
-    rot_z = FloatSlider(description="Yaw (Z°)", min=-180.0, max=180.0, step=0.1, value=0.0, readout_format=".1f", continuous_update=False)
-    rot_y = FloatSlider(description="Pitch (Y°)", min=-180.0, max=180.0, step=0.1, value=0.0, readout_format=".1f", continuous_update=False)
-    rot_x = FloatSlider(description="Roll (X°)", min=-180.0, max=180.0, step=0.1, value=0.0, readout_format=".1f", continuous_update=False)
+    # Rotation controls
+    rot_z = FloatSlider(description="Yaw (Z°)", min=-180.0, max=180.0, step=0.1, value=0.0, readout_format=".1f", continuous_update=True)
+    rot_y = FloatSlider(description="Pitch (Y°)", min=-180.0, max=180.0, step=0.1, value=0.0, readout_format=".1f", continuous_update=True)
+    rot_x = FloatSlider(description="Roll (X°)", min=-180.0, max=180.0, step=0.1, value=0.0, readout_format=".1f", continuous_update=True)
     rot_reset = Button(description="Reset Rotation")
-    rot_label = Label(value="Rotate entire volume (0.1° resolution)")
+    rot_label = Label(value="Rotate 0.1° (fast reslice)")
+    fast_preview = ToggleButton(value=False, description="Fast Preview")
 
     HIST_BINS = 256
     hist_lines = {"xy": None, "zy": None, "zx": None}
@@ -217,16 +273,36 @@ def interactive_slice_plotter(
     trinarize_params = {"mu": None, "sigma": None, "lo": None, "hi": None}
     saved_norm_before_trin = {"norm": None}
 
+    # --------- Helpers bound to state ---------
+    def _active_R():
+        a = (rot_state["z"], rot_state["y"], rot_state["x"])
+        if a != rot_cache["angles"]:
+            rot_cache["R"] = _rot_mats(a[0], a[1], a[2])
+            rot_cache["angles"] = a
+        return rot_cache["R"]
+
     def _active_volume():
+        """Only used in legacy 'volume' engine."""
         a = (rot_state["z"], rot_state["y"], rot_state["x"])
         if a != rot_cache["angles"]:
             rot_cache["vol"] = rotate_volume_3d(vol, a[0], a[1], a[2])
             rot_cache["angles"] = a
         return rot_cache["vol"]
 
-    def _slice_xy(z): return np.take(_active_volume(), indices=z, axis=0)
-    def _slice_zy(y): return np.take(_active_volume(), indices=y, axis=1)
-    def _slice_zx(x): return np.take(_active_volume(), indices=x, axis=2)
+    def _slice_xy(z):
+        if rotation_engine == "volume":
+            return np.take(_active_volume(), indices=z, axis=0)
+        return _reslice_plane(vol, _active_R(), z, 'xy', center, order=interp_order_state["order"])
+
+    def _slice_zy(y):
+        if rotation_engine == "volume":
+            return np.take(_active_volume(), indices=y, axis=1)
+        return _reslice_plane(vol, _active_R(), y, 'zy', center, order=interp_order_state["order"])
+
+    def _slice_zx(x):
+        if rotation_engine == "volume":
+            return np.take(_active_volume(), indices=x, axis=2)
+        return _reslice_plane(vol, _active_R(), x, 'zx', center, order=interp_order_state["order"])
 
     def _update_hist_axis(axh, line, arr, vmin, vmax, title):
         counts, edges = _hist_counts(arr, vmin, vmax, HIST_BINS)
@@ -242,7 +318,12 @@ def interactive_slice_plotter(
 
     def _compute_trinarize_params():
         lo_r, hi_r = vmin0, vmax0
-        vals = _finite(_active_volume())
+        # sample three central slices for speed
+        vals = np.concatenate([
+            _finite(vol[sZ].ravel()),
+            _finite(vol[:, :, sX].ravel()),
+            _finite(vol[:, sY, :].ravel())
+        ])
         if vals.size > 2_000_000:
             idx = np.random.default_rng(1).choice(vals.size, size=2_000_000, replace=False)
             vals = vals[idx]
@@ -284,6 +365,7 @@ def interactive_slice_plotter(
         out[mask & (a > hi_t)] = +1
         return out
 
+    # --------- Main update ---------
     def update(*_):
         sliceZ, sliceY, sliceX = zslider.value, yslider.value, xslider.value
         vmin, vmax, cmap_name = float(min_box.value), float(max_box.value), cmap_dd.value
@@ -297,10 +379,12 @@ def interactive_slice_plotter(
             im_zy.set_data(_slice_zy(sliceY))
             im_zx.set_data(_slice_zx(sliceX))
 
+        # Crosshairs
         line_xy_y.set_xdata([sliceX * vx, sliceX * vx]); line_xy_x.set_ydata([sliceY * vy, sliceY * vy])
         line_zy_x.set_xdata([sliceX * vx, sliceX * vx]); line_zy_z.set_ydata([sliceZ * vz, sliceZ * vz])
         line_zx_y.set_xdata([sliceY * vy, sliceY * vy]); line_zx_z.set_ydata([sliceZ * vz, sliceZ * vz])
 
+        # Contrast / cmap
         if not trinarize_toggle.value:
             if isinstance(norm_holder["norm"], TwoSlopeNorm):
                 new_norm = TwoSlopeNorm(vcenter=0.0, vmin=vmin, vmax=vmax)
@@ -311,6 +395,7 @@ def interactive_slice_plotter(
             im_xy.set_cmap(cmap_name); im_zy.set_cmap(cmap_name); im_zx.set_cmap(cmap_name)
             cbar.update_normal(im_xy)
 
+        # Histograms
         if hist_toggle.value:
             hist_lines["xy"] = _update_hist_axis(ax_hxy, hist_lines["xy"], _slice_xy(sliceZ), vmin, vmax, "XY histogram")
             hist_lines["zy"] = _update_hist_axis(ax_hzy, hist_lines["zy"], _slice_zy(sliceY), vmin, vmax, "ZY histogram")
@@ -318,6 +403,7 @@ def interactive_slice_plotter(
 
         fig.canvas.draw_idle()
 
+    # --------- Linked pan/zoom ---------
     def _set_xlim(ax, lim): ax.set_xlim(lim[0], lim[1])
     def _set_ylim(ax, lim): ax.set_ylim(lim[0], lim[1])
     sync_guard = {"on": False}
@@ -352,6 +438,7 @@ def interactive_slice_plotter(
     ax_zx.callbacks.connect("xlim_changed", on_zx_limits_changed)
     ax_zx.callbacks.connect("ylim_changed", on_zx_limits_changed)
 
+    # --------- Events ---------
     def on_save(_):
         path = save_path.value.strip()
         if path:
@@ -372,9 +459,9 @@ def interactive_slice_plotter(
             saved_norm_before_trin["norm"] = norm_holder["norm"]
             trin_norm = Normalize(vmin=-1.0, vmax=+1.0)
             im_xy.set_norm(trin_norm); im_zy.set_norm(trin_norm); im_zx.set_norm(trin_norm)
-            im_xy.set_cmap(ListedColormap(["#2c7bb6", "#f7f7f7", "#d7191c"]))
-            im_zy.set_cmap(ListedColormap(["#2c7bb6", "#f7f7f7", "#d7191c"]))
-            im_zx.set_cmap(ListedColormap(["#2c7bb6", "#f7f7f7", "#d7191c"]))
+            # discrete {-1,0,1} colormap
+            disc = ListedColormap(["#2c7bb6", "#f7f7f7", "#d7191c"])
+            im_xy.set_cmap(disc); im_zy.set_cmap(disc); im_zx.set_cmap(disc)
             cbar.update_normal(im_xy)
         else:
             old = saved_norm_before_trin["norm"]
@@ -386,13 +473,14 @@ def interactive_slice_plotter(
         update()
 
     def on_reset(_):
-        zslider.value, yslider.value, xslider.value = zlen // 2, ylen // 2, xlen // 2
+        zslider.value, yslider.value, xslider.value = Z // 2, Y // 2, X // 2
         min_box.value, max_box.value = vmin0, vmax0
         cmap_dd.value = cmap0
         hist_toggle.value = False
         trinarize_toggle.value = False
         save_path.value = ""
         rot_z.value = 0.0; rot_y.value = 0.0; rot_x.value = 0.0
+        fast_preview.value = False
 
     def on_rot_change(_):
         rot_state["z"] = float(rot_z.value)
@@ -403,32 +491,36 @@ def interactive_slice_plotter(
     def on_rot_reset(_):
         rot_z.value = 0.0; rot_y.value = 0.0; rot_x.value = 0.0
 
+    def on_fast_preview(change):
+        interp_order_state["order"] = 0 if change["new"] else 1
+        update()
+
+    # Wire up
     save_btn.on_click(on_save)
     hist_toggle.observe(on_toggle_hist, names="value")
     trinarize_toggle.observe(on_toggle_trinarize, names="value")
     reset_btn.on_click(on_reset)
-    # Wire up slice sliders + contrast + colormap
     zslider.observe(update, names="value")
     yslider.observe(update, names="value")
     xslider.observe(update, names="value")
     min_box.observe(update, names="value")
     max_box.observe(update, names="value")
     cmap_dd.observe(update, names="value")
-    # Rotation events
     rot_z.observe(on_rot_change, names="value")
     rot_y.observe(on_rot_change, names="value")
     rot_x.observe(on_rot_change, names="value")
     rot_reset.on_click(on_rot_reset)
+    fast_preview.observe(on_fast_preview, names="value")
 
+    # Layout
     controls_top = HBox([zslider, yslider, xslider])
     controls_mid = HBox([min_box, max_box, cmap_dd, hist_toggle, trinarize_toggle, reset_btn])
-    controls_rot = HBox([rot_label, rot_z, rot_y, rot_x, rot_reset])
+    controls_rot = HBox([rot_label, rot_z, rot_y, rot_x, rot_reset, fast_preview])
     controls_save = HBox([save_path, save_btn])
-
     container = VBox([controls_top, controls_mid, controls_rot, out_fig, controls_save])
 
+    # Initial render
     update()
-
     if display_container:
         display(container)
 
@@ -440,7 +532,8 @@ def interactive_slice_plotter(
             z=zslider, y=yslider, x=xslider, vmin=min_box, vmax=max_box,
             cmap=cmap_dd, save_path=save_path, save_btn=save_btn,
             hist_toggle=hist_toggle, trinarize_toggle=trinarize_toggle, reset=reset_btn,
-            rot_z=rot_z, rot_y=rot_y, rot_x=rot_x, rot_reset=rot_reset
+            rot_z=rot_z, rot_y=rot_y, rot_x=rot_x, rot_reset=rot_reset,
+            fast_preview=fast_preview
         ),
         "colorbar": cbar,
         "trinarize_params": trinarize_params,
